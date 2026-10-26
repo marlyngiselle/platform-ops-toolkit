@@ -158,7 +158,7 @@ function Get-ServerHealthSnapshot {
             $errorEvents = $null
             $topSources = @()
             try {
-                $eventArgs = @{
+                $winEventParams = @{
                     FilterHashtable = @{
                         LogName   = @('System', 'Application')
                         Level     = @(1, 2)
@@ -167,9 +167,9 @@ function Get-ServerHealthSnapshot {
                     ErrorAction     = 'Stop'
                 }
                 if (-not $isLocal) {
-                    $eventArgs.ComputerName = $computer
+                    $winEventParams.ComputerName = $computer
                 }
-                $logEntries = @(Get-WinEvent @eventArgs)
+                $logEntries = @(Get-WinEvent @winEventParams)
                 $errorEvents = $logEntries.Count
                 $topSources = @($logEntries |
                         Group-Object -Property ProviderName |
