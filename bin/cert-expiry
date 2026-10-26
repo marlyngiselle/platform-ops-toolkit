@@ -1,0 +1,168 @@
+#!/usr/bin/env bash
+#
+# cert-expiry - check TLS certificate expiry for a list of endpoints.
+# Monitoring friendly: exit code reflects the worst result found.
+
+set -euo pipefail
+
+_self_dir() {
+  local src="${BASH_SOURCE[0]}" dir
+  while [[ -L "$src" ]]; do
+    dir="$(cd -P "$(dirname "$src")" && pwd)"
+    src="$(readlink "$src")"
+    [[ "$src" == /* ]] || src="${dir}/${src}"
+  done
+  cd -P "$(dirname "$src")" && pwd
+}
+# shellcheck source=../lib/common.sh
+source "$(_self_dir)/../lib/common.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: cert-expiry [options] HOST[:PORT] [HOST[:PORT]...]
+
+Connect to each endpoint, read the served certificate (with SNI) and report
+the days left before it expires.
+
+Options:
+  -f, --file FILE        Read endpoints from FILE (one per line, '#' comments)
+  -w, --warning DAYS     Warning threshold in days (default: 30)
+  -c, --critical DAYS    Critical threshold in days (default: 7)
+  -t, --timeout SECONDS  Connection timeout per endpoint (default: 10)
+      --json             Emit a JSON array instead of a table (requires jq)
+  -v, --verbose | -q, --quiet | --no-color | --version | -h, --help
+
+Exit codes (worst result wins):
+  0 OK   1 WARNING   2 CRITICAL or expired   3 UNKNOWN (unreachable endpoint)
+  64 usage error     69 missing dependency
+
+Examples:
+  cert-expiry www.example.com api.example.com:8443
+  cert-expiry -f endpoints.txt -w 21 -c 5 --json
+EOF
+}
+
+warn_days=30 crit_days=7 timeout_s=10 output=table
+endpoints=()
+
+# fetch_not_after HOST PORT - print the certificate notAfter date.
+fetch_not_after() {
+  local host="$1" port="$2" timeout_cmd=()
+  if command -v timeout >/dev/null 2>&1; then
+    timeout_cmd=(timeout "$timeout_s")
+  fi
+  ${timeout_cmd[@]+"${timeout_cmd[@]}"} openssl s_client -servername "$host" -connect "${host}:${port}" </dev/null 2>/dev/null |
+    openssl x509 -noout -enddate 2>/dev/null |
+    sed -n 's/^notAfter=//p'
+}
+
+read_endpoint_file() {
+  local file="$1" line
+  [[ -r "$file" ]] || usage_error "cannot read endpoint file: ${file}"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%%#*}"
+    line="$(echo "$line" | tr -d '[:space:]')"
+    if [[ -n "$line" ]]; then endpoints+=("$line"); fi
+  done <"$file"
+}
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h | --help)
+        usage
+        exit 0
+        ;;
+      -f | --file)
+        require_arg "$@"
+        read_endpoint_file "$2"
+        shift
+        ;;
+      -w | --warning)
+        require_arg "$@"
+        is_positive_int "$2" || usage_error "--warning must be a whole number of days"
+        warn_days="$2"
+        shift
+        ;;
+      -c | --critical)
+        require_arg "$@"
+        is_positive_int "$2" || usage_error "--critical must be a whole number of days"
+        crit_days="$2"
+        shift
+        ;;
+      -t | --timeout)
+        require_arg "$@"
+        is_positive_int "$2" || usage_error "--timeout must be a whole number of seconds"
+        timeout_s="$2"
+        shift
+        ;;
+      --json) output=json ;;
+      -*)
+        handle_common_flag "$1" || usage_error "unknown option: $1"
+        ;;
+      *) endpoints+=("$1") ;;
+    esac
+    shift
+  done
+  ((${#endpoints[@]} > 0)) || usage_error "no endpoints given"
+  ((crit_days <= warn_days)) || usage_error "--critical must not exceed --warning"
+}
+
+main() {
+  parse_args "$@"
+  require_cmd openssl
+  if [[ "$output" == json ]]; then require_cmd jq; fi
+
+  local worst=$EX_OK rows=() endpoint host port not_after epoch days status code
+  for endpoint in "${endpoints[@]}"; do
+    host="${endpoint%%:*}"
+    port=443
+    if [[ "$endpoint" == *:* ]]; then port="${endpoint##*:}"; fi
+    log_debug "checking ${host}:${port}"
+
+    not_after="$(fetch_not_after "$host" "$port" || true)"
+    if [[ -z "$not_after" ]] || ! epoch="$(to_epoch "$not_after")"; then
+      log_warn "${host}:${port}: could not retrieve certificate"
+      days="" status=UNKNOWN code=$EX_UNKNOWN not_after=""
+    else
+      days="$(days_until "$epoch")"
+      not_after="$(epoch_to_iso "$epoch")"
+      if ((days < 0)); then
+        status=EXPIRED code=$EX_CRIT
+      elif ((days <= crit_days)); then
+        status=CRITICAL code=$EX_CRIT
+      elif ((days <= warn_days)); then
+        status=WARNING code=$EX_WARN
+      else
+        status=OK code=$EX_OK
+      fi
+    fi
+    # UNKNOWN (3) must not hide a CRITICAL (2): rank explicitly.
+    if ((code == EX_CRIT)) || { ((code == EX_UNKNOWN)) && ((worst != EX_CRIT)); } ||
+      { ((code == EX_WARN)) && ((worst == EX_OK)); }; then
+      worst=$code
+    fi
+    rows+=("${host}|${port}|${days}|${not_after}|${status}")
+  done
+
+  if [[ "$output" == json ]]; then
+    printf '%s\n' "${rows[@]}" | jq -R -s '
+      split("\n") | map(select(length > 0) | split("|") | {
+        host: .[0],
+        port: (.[1] | tonumber),
+        days_left: (if .[2] == "" then null else (.[2] | tonumber) end),
+        not_after: (if .[3] == "" then null else .[3] end),
+        status: .[4]
+      })'
+  else
+    printf '%-40s %-6s %-9s %-21s %s\n' HOST PORT DAYS_LEFT NOT_AFTER STATUS
+    local row
+    for row in "${rows[@]}"; do
+      IFS='|' read -r host port days not_after status <<<"$row"
+      printf '%-40s %-6s %-9s %-21s %s\n' "$host" "$port" "${days:--}" "${not_after:--}" "$status"
+    done
+  fi
+  return "$worst"
+}
+
+main "$@"

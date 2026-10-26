@@ -1,0 +1,237 @@
+#!/usr/bin/env bash
+#
+# context-guard - show and assert the active cloud/cluster context before a
+# command runs, so a destructive change lands where you think it lands.
+
+set -euo pipefail
+
+_self_dir() {
+  local src="${BASH_SOURCE[0]}" dir
+  while [[ -L "$src" ]]; do
+    dir="$(cd -P "$(dirname "$src")" && pwd)"
+    src="$(readlink "$src")"
+    [[ "$src" == /* ]] || src="${dir}/${src}"
+  done
+  cd -P "$(dirname "$src")" && pwd
+}
+# shellcheck source=../lib/common.sh
+source "$(_self_dir)/../lib/common.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: context-guard [options] [-- COMMAND [ARGS...]]
+
+Print the active Azure subscription, AWS identity and kubectl context, check
+them against your expectations, and optionally run COMMAND after an explicit
+confirmation.
+
+Providers (default: every provider whose CLI is installed):
+  --azure                      Check the Azure CLI account
+  --aws                        Check the AWS CLI identity
+  --kube                       Check the kubectl context
+
+Assertions (shell glob patterns, e.g. 'sub-dev-*'):
+  --expect-az-sub PATTERN      Azure subscription name or ID must match
+  --expect-aws-account PATTERN AWS account ID must match
+  --expect-kube-context PATTERN
+                               kubectl context must match
+  --protect PATTERN            Contexts matching PATTERN (e.g. '*prod*') need the
+                               context name typed back, not just "y" (repeatable)
+
+Execution:
+  -y, --yes                    Do not prompt (for automation; assertions still apply)
+  -n, --dry-run                Show the command instead of running it
+  -v, --verbose | -q, --quiet | --no-color | --version | -h, --help
+
+Exit codes:
+  0   context matches (and COMMAND, if given, exited 0)
+  64  usage error        69  required CLI missing
+  77  assertion failed, protected context refused, or confirmation declined
+  *   otherwise COMMAND's own exit code
+
+Examples:
+  context-guard
+  context-guard --kube --expect-kube-context 'aks-dev-*' -- kubectl delete ns scratch
+  context-guard --azure --protect '*prod*' -- az group delete -n rg-sandbox-01
+EOF
+}
+
+check_azure=0 check_aws=0 check_kube=0
+expect_az="" expect_aws="" expect_kube=""
+protect_patterns=()
+command_args=()
+
+# Populated by the collectors below.
+az_label="" aws_label="" kube_label=""
+failures=0
+
+collect_azure() {
+  local line name id user
+  if ! line="$(az account show --query '[name, id, user.name]' -o tsv 2>/dev/null | tr '\n' '\t')"; then
+    log_error "azure: no active account (run 'az login')"
+    failures=$((failures + 1))
+    return 0
+  fi
+  IFS=$'\t' read -r name id user <<<"$line"
+  az_label="$name"
+  printf '  %-8s subscription=%s id=%s user=%s\n' "azure" "$name" "$id" "$user"
+  if [[ -n "$expect_az" ]]; then
+    # shellcheck disable=SC2053  # glob match is intended
+    if [[ "$name" == $expect_az || "$id" == $expect_az ]]; then
+      log_info "azure: subscription matches '${expect_az}'"
+    else
+      log_error "azure: subscription '${name}' does not match '${expect_az}'"
+      failures=$((failures + 1))
+    fi
+  fi
+}
+
+collect_aws() {
+  local line account arn profile
+  profile="${AWS_PROFILE:-${AWS_DEFAULT_PROFILE:-default}}"
+  if ! line="$(aws sts get-caller-identity --query '[Account, Arn]' --output text 2>/dev/null)"; then
+    log_error "aws: no valid credentials for profile '${profile}'"
+    failures=$((failures + 1))
+    return 0
+  fi
+  read -r account arn <<<"$line"
+  aws_label="${profile}:${account}"
+  printf '  %-8s profile=%s account=%s arn=%s\n' "aws" "$profile" "$account" "$arn"
+  if [[ -n "$expect_aws" ]]; then
+    # shellcheck disable=SC2053
+    if [[ "$account" == $expect_aws ]]; then
+      log_info "aws: account matches '${expect_aws}'"
+    else
+      log_error "aws: account '${account}' does not match '${expect_aws}'"
+      failures=$((failures + 1))
+    fi
+  fi
+}
+
+collect_kube() {
+  local ctx ns
+  if ! ctx="$(kubectl config current-context 2>/dev/null)"; then
+    log_error "kube: no current context set"
+    failures=$((failures + 1))
+    return 0
+  fi
+  ns="$(kubectl config view --minify -o 'jsonpath={..namespace}' 2>/dev/null || true)"
+  kube_label="$ctx"
+  printf '  %-8s context=%s namespace=%s\n' "kube" "$ctx" "${ns:-default}"
+  if [[ -n "$expect_kube" ]]; then
+    # shellcheck disable=SC2053
+    if [[ "$ctx" == $expect_kube ]]; then
+      log_info "kube: context matches '${expect_kube}'"
+    else
+      log_error "kube: context '${ctx}' does not match '${expect_kube}'"
+      failures=$((failures + 1))
+    fi
+  fi
+}
+
+# protected_label - print the first active context that matches --protect.
+protected_label() {
+  local label pattern
+  for label in "$az_label" "$aws_label" "$kube_label"; do
+    [[ -n "$label" ]] || continue
+    for pattern in ${protect_patterns[@]+"${protect_patterns[@]}"}; do
+      # shellcheck disable=SC2053
+      if [[ "$label" == $pattern ]]; then
+        echo "$label"
+        return 0
+      fi
+    done
+  done
+  return 1
+}
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h | --help)
+        usage
+        exit 0
+        ;;
+      --azure) check_azure=1 ;;
+      --aws) check_aws=1 ;;
+      --kube) check_kube=1 ;;
+      --expect-az-sub)
+        require_arg "$@"
+        expect_az="$2" check_azure=1
+        shift
+        ;;
+      --expect-aws-account)
+        require_arg "$@"
+        expect_aws="$2" check_aws=1
+        shift
+        ;;
+      --expect-kube-context)
+        require_arg "$@"
+        expect_kube="$2" check_kube=1
+        shift
+        ;;
+      --protect)
+        require_arg "$@"
+        protect_patterns+=("$2")
+        shift
+        ;;
+      -y | --yes) ASSUME_YES=1 ;;
+      -n | --dry-run) DRY_RUN=1 ;;
+      --)
+        shift
+        command_args=("$@")
+        break
+        ;;
+      *)
+        handle_common_flag "$1" || usage_error "unknown option: $1"
+        ;;
+    esac
+    shift
+  done
+}
+
+main() {
+  parse_args "$@"
+
+  if ((check_azure + check_aws + check_kube == 0)); then
+    command -v az >/dev/null 2>&1 && check_azure=1
+    command -v aws >/dev/null 2>&1 && check_aws=1
+    command -v kubectl >/dev/null 2>&1 && check_kube=1
+    if ((check_azure + check_aws + check_kube == 0)); then
+      die "none of az, aws or kubectl is installed" "$EX_UNAVAILABLE"
+    fi
+  fi
+  ((check_azure)) && require_cmd az
+  ((check_aws)) && require_cmd aws
+  ((check_kube)) && require_cmd kubectl
+
+  echo "Active context:"
+  ((check_azure)) && collect_azure
+  ((check_aws)) && collect_aws
+  ((check_kube)) && collect_kube
+
+  if ((failures > 0)); then
+    die "${failures} context check(s) failed; refusing to continue" "$EX_REFUSED"
+  fi
+
+  if ((${#command_args[@]} == 0)); then
+    return 0
+  fi
+
+  local guarded
+  if guarded="$(protected_label)"; then
+    log_warn "context '${guarded}' is protected"
+    if [[ "$ASSUME_YES" == 1 ]]; then
+      log_warn "proceeding on protected context because --yes was given"
+    else
+      confirm "About to run on a PROTECTED context: $(quote_cmd "${command_args[@]}")" "$guarded" ||
+        die "confirmation declined" "$EX_REFUSED"
+    fi
+  else
+    confirm "Run: $(quote_cmd "${command_args[@]}")" || die "confirmation declined" "$EX_REFUSED"
+  fi
+
+  run_cmd "${command_args[@]}"
+}
+
+main "$@"
