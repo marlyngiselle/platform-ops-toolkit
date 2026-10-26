@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="300" viewBox="0 0 1200 300" role="img" aria-label="platform-ops-toolkit">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0b1f4d"/>
+      <stop offset="1" stop-color="#2456c8"/>
+    </linearGradient>
+    <pattern id="dots" width="28" height="28" patternUnits="userSpaceOnUse">
+      <circle cx="2" cy="2" r="1.4" fill="#ffffff" fill-opacity="0.08"/>
+    </pattern>
+  </defs>
+  <rect width="1200" height="300" fill="url(#bg)"/>
+  <rect width="1200" height="300" fill="url(#dots)"/>
+  <!-- node network: clouds, clusters, servers -->
+  <g stroke="#93c5fd" stroke-opacity="0.45" stroke-width="2" fill="none">
+    <path d="M820 90 L930 150 L1060 95 M930 150 L900 240 M930 150 L1080 215 M820 90 L760 190 L900 240 M1060 95 L1140 160 L1080 215"/>
+  </g>
+  <g fill="#0b1f4d" stroke="#ffffff" stroke-width="3">
+    <circle cx="820" cy="90" r="11"/><circle cx="1060" cy="95" r="11"/><circle cx="760" cy="190" r="9"/>
+    <circle cx="900" cy="240" r="9"/><circle cx="1080" cy="215" r="11"/><circle cx="1140" cy="160" r="8"/>
+  </g>
+  <g>
+    <circle cx="930" cy="150" r="30" fill="#2456c8" stroke="#ffffff" stroke-width="3"/>
+    <path d="M916 150 l9 9 l18 -19" fill="none" stroke="#ffffff" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+  <!-- terminal card -->
+  <g transform="translate(500 200)">
+    <rect width="250" height="66" rx="10" fill="#0b1f4d" fill-opacity="0.65" stroke="#ffffff" stroke-opacity="0.25"/>
+    <circle cx="18" cy="16" r="4" fill="#ffffff" fill-opacity="0.35"/>
+    <circle cx="32" cy="16" r="4" fill="#ffffff" fill-opacity="0.35"/>
+    <circle cx="46" cy="16" r="4" fill="#ffffff" fill-opacity="0.35"/>
+    <text x="16" y="48" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="16" fill="#dbeafe">$ az-orphans --dry-run</text>
+  </g>
+  <text x="64" y="132" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="52" font-weight="700" fill="#ffffff">platform-ops-toolkit</text>
+  <text x="66" y="180" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="24" fill="#dbeafe">Small, sharp tools for cloud and platform operations.</text>
+  <text x="66" y="226" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="18" fill="#93c5fd">Azure · AWS · Kubernetes · Windows</text>
+</svg>
