@@ -1,0 +1,155 @@
+#!/usr/bin/env bash
+#
+# aws-inventory - export an AWS resource inventory (service, type, region,
+# tags, owner) to CSV using the Resource Groups Tagging API. Read-only.
+
+set -euo pipefail
+
+_self_dir() {
+  local src="${BASH_SOURCE[0]}" dir
+  while [[ -L "$src" ]]; do
+    dir="$(cd -P "$(dirname "$src")" && pwd)"
+    src="$(readlink "$src")"
+    [[ "$src" == /* ]] || src="${dir}/${src}"
+  done
+  cd -P "$(dirname "$src")" && pwd
+}
+# shellcheck source=../lib/common.sh
+source "$(_self_dir)/../lib/common.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: aws-inventory [options]
+
+Export the resources of the current account as CSV, one row per resource,
+with selected tags promoted to their own columns.
+
+Scope (default: the profile's configured region):
+  -r, --region NAME        Region to scan (repeatable)
+      --all-regions        Every region enabled for the account
+  -p, --profile NAME       AWS CLI profile (default: AWS_PROFILE or default)
+
+Output:
+  -t, --tag KEY            Promote tag KEY to a column (repeatable,
+                           case-insensitive; default: owner, environment)
+  -o, --output FILE        CSV path, '-' for stdout (default: stdout)
+  -v, --verbose | -q, --quiet | --no-color | --version | -h, --help
+
+Columns:
+  account_id,region,service,resource_type,resource_id,<tag columns>,tags,arn
+
+Note: the Tagging API lists resources that are, or have been, tagged. Resources
+that never carried a tag are not returned; that gap is itself a finding.
+
+Exit codes:
+  0 inventory written   64 usage error   69 missing dependency or not signed in
+
+Permissions: tag:GetResources, ec2:DescribeRegions, sts:GetCallerIdentity.
+
+Examples:
+  aws-inventory -r eu-west-1 -o inventory.csv
+  aws-inventory --all-regions -t owner -t cost-center -o all.csv
+EOF
+}
+
+regions=() all_regions=0 tags=() output="-" aws_args=()
+
+awsc() {
+  aws ${aws_args[@]+"${aws_args[@]}"} "$@"
+}
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h | --help)
+        usage
+        exit 0
+        ;;
+      -r | --region)
+        require_arg "$@"
+        regions+=("$2")
+        shift
+        ;;
+      --all-regions) all_regions=1 ;;
+      -p | --profile)
+        require_arg "$@"
+        aws_args=(--profile "$2")
+        shift
+        ;;
+      -t | --tag)
+        require_arg "$@"
+        tags+=("$2")
+        shift
+        ;;
+      -o | --output)
+        [[ $# -ge 2 && -n "$2" ]] || usage_error "option $1 requires a value"
+        output="$2"
+        shift
+        ;;
+      *)
+        handle_common_flag "$1" || usage_error "unknown option: $1"
+        ;;
+    esac
+    shift
+  done
+  if ((all_regions)) && ((${#regions[@]} > 0)); then
+    usage_error "--all-regions and --region are mutually exclusive"
+  fi
+  if ((${#tags[@]} == 0)); then
+    tags=(owner environment)
+  fi
+}
+
+main() {
+  parse_args "$@"
+  require_cmd aws jq
+
+  local account
+  account="$(awsc sts get-caller-identity --query Account --output text 2>/dev/null)" ||
+    die "no valid AWS credentials (check your profile or run 'aws sso login')" "$EX_UNAVAILABLE"
+
+  if ((all_regions)); then
+    local r
+    for r in $(awsc ec2 describe-regions --query 'Regions[].RegionName' --output text); do
+      regions+=("$r")
+    done
+  elif ((${#regions[@]} == 0)); then
+    local configured
+    configured="$(awsc configure get region 2>/dev/null || true)"
+    regions=("${AWS_REGION:-${AWS_DEFAULT_REGION:-${configured:-us-east-1}}}")
+  fi
+
+  local tmp
+  tmp="$(mktemp)"
+  # shellcheck disable=SC2064  # expand now: tmp is local
+  trap "rm -f '$tmp'" EXIT
+
+  local region
+  for region in "${regions[@]}"; do
+    log_info "scanning account ${account} in ${region}"
+    awsc resourcegroupstaggingapi get-resources --region "$region" --output json |
+      jq -c --arg region "$region" '.ResourceTagMappingList[] | . + {QueriedRegion: $region}' >>"$tmp"
+  done
+
+  local tag_keys header=(account_id region service resource_type resource_id) t
+  tag_keys="$(printf '%s\n' "${tags[@]}" | jq -R . | jq -s -c .)"
+  for t in "${tags[@]}"; do header+=("tag_${t}"); done
+  header+=(tags arn)
+
+  open_output "$output"
+  csv_row "${header[@]}"
+  jq -r -s --argjson keys "$tag_keys" '
+    def tag($k): (.Tags // []) | map(select((.Key | ascii_downcase) == ($k | ascii_downcase)))
+      | (first | .Value) // "";
+    unique_by(.ResourceARN)[]
+    | (.ResourceARN | split(":")) as $p
+    | ($p[5:] | join(":")) as $res
+    | ($res | capture("^(?<type>[^/:]+)[/:](?<id>.+)$") // {type: "", id: $res}) as $r
+    | [ $p[4], (if $p[3] == "" then "global" else $p[3] end), $p[2], $r.type, $r.id ]
+      + [ . as $m | $keys[] | . as $k | $m | tag($k) ]
+      + [ ((.Tags // []) | map("\(.Key)=\(.Value)") | join(";")), .ResourceARN ]
+    | @csv' "$tmp"
+  [[ "$output" == "-" ]] || log_info "inventory written to ${output}"
+}
+
+main "$@"

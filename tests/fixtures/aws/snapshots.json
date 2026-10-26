@@ -1,0 +1,4 @@
+{"Snapshots": [
+  {"SnapshotId": "snap-0old0000000000001", "VolumeSize": 100, "StartTime": "2026-02-01T00:00:00.000Z"},
+  {"SnapshotId": "snap-0new0000000000002", "VolumeSize": 100, "StartTime": "2026-12-15T00:00:00.000Z"}
+]}

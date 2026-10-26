@@ -1,0 +1,11 @@
+[
+  {"id": "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/rg-web-dev/providers/Microsoft.Web/sites/app-web-dev-01",
+   "name": "app-web-dev-01", "type": "Microsoft.Web/sites", "location": "westeurope", "resourceGroup": "rg-web-dev",
+   "tags": {"Owner": "team-web", "environment": "dev"}},
+  {"id": "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/rg-data-dev/providers/Microsoft.Storage/storageAccounts/stdatadev001",
+   "name": "stdatadev001", "type": "Microsoft.Storage/storageAccounts", "location": "westeurope", "resourceGroup": "rg-data-dev",
+   "tags": {"owner": "team-data", "cost-center": "cc-1001, shared"}},
+  {"id": "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/rg-data-dev/providers/Microsoft.Network/publicIPAddresses/pip-untagged",
+   "name": "pip-untagged", "type": "Microsoft.Network/publicIPAddresses", "location": "northeurope", "resourceGroup": "rg-data-dev",
+   "tags": null}
+]

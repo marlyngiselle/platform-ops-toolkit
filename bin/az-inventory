@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+#
+# az-inventory - export an Azure resource inventory (type, region, tags,
+# owner) to CSV. Read-only.
+
+set -euo pipefail
+
+_self_dir() {
+  local src="${BASH_SOURCE[0]}" dir
+  while [[ -L "$src" ]]; do
+    dir="$(cd -P "$(dirname "$src")" && pwd)"
+    src="$(readlink "$src")"
+    [[ "$src" == /* ]] || src="${dir}/${src}"
+  done
+  cd -P "$(dirname "$src")" && pwd
+}
+# shellcheck source=../lib/common.sh
+source "$(_self_dir)/../lib/common.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: az-inventory [options]
+
+Export every resource visible to the signed-in identity as CSV, one row per
+resource, with selected tags promoted to their own columns.
+
+Scope (default: the current subscription):
+  -s, --subscription ID|NAME   Subscription to export (repeatable)
+      --all-subscriptions      Every enabled subscription you can read
+  -g, --resource-group NAME    Limit to one resource group
+
+Output:
+  -t, --tag KEY                Promote tag KEY to a column (repeatable,
+                               case-insensitive; default: owner, environment)
+  -o, --output FILE            CSV path, '-' for stdout (default: stdout)
+  -v, --verbose | -q, --quiet | --no-color | --version | -h, --help
+
+Columns:
+  subscription_id,resource_group,name,type,location,<tag columns>,tags
+
+Exit codes:
+  0 inventory written   64 usage error   69 missing dependency or not signed in
+
+Permissions: Reader on the subscriptions (or resource group) in scope.
+
+Examples:
+  az-inventory -o inventory.csv
+  az-inventory --all-subscriptions -t owner -t cost-center -o all.csv
+EOF
+}
+
+subscriptions=() resource_group="" tags=() output="-" all_subs=0
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h | --help)
+        usage
+        exit 0
+        ;;
+      -s | --subscription)
+        require_arg "$@"
+        subscriptions+=("$2")
+        shift
+        ;;
+      --all-subscriptions) all_subs=1 ;;
+      -g | --resource-group)
+        require_arg "$@"
+        resource_group="$2"
+        shift
+        ;;
+      -t | --tag)
+        require_arg "$@"
+        tags+=("$2")
+        shift
+        ;;
+      -o | --output)
+        [[ $# -ge 2 && -n "$2" ]] || usage_error "option $1 requires a value"
+        output="$2"
+        shift
+        ;;
+      *)
+        handle_common_flag "$1" || usage_error "unknown option: $1"
+        ;;
+    esac
+    shift
+  done
+  if ((all_subs)) && ((${#subscriptions[@]} > 0)); then
+    usage_error "--all-subscriptions and --subscription are mutually exclusive"
+  fi
+  if ((${#tags[@]} == 0)); then
+    tags=(owner environment)
+  fi
+}
+
+# tags_json - the promoted tag keys as a JSON array.
+tags_json() {
+  printf '%s\n' "${tags[@]}" | jq -R . | jq -s -c .
+}
+
+export_subscription() {
+  local sub="$1" tag_keys="$2"
+  local args=(resource list --subscription "$sub" -o json)
+  [[ -z "$resource_group" ]] || args+=(--resource-group "$resource_group")
+  log_info "listing resources in subscription ${sub}${resource_group:+ / ${resource_group}}"
+  az "${args[@]}" | jq -r --arg sub "$sub" --argjson keys "$tag_keys" '
+    def tag($k): (.tags // {}) | to_entries
+      | map(select((.key | ascii_downcase) == ($k | ascii_downcase))) | (first | .value) // "";
+    sort_by(.resourceGroup, .type, .name)[]
+    | [ (.id | split("/")[2] // $sub),
+        .resourceGroup, .name, .type, .location ]
+      + [ . as $r | $keys[] | . as $k | $r | tag($k) ]
+      + [ (.tags // {}) | to_entries | map("\(.key)=\(.value)") | join(";") ]
+    | @csv'
+}
+
+main() {
+  parse_args "$@"
+  require_cmd az jq
+
+  if ((all_subs)); then
+    local line
+    while IFS= read -r line; do
+      if [[ -n "$line" ]]; then subscriptions+=("$line"); fi
+    done < <(az account list --query "[?state=='Enabled'].id" -o tsv)
+  elif ((${#subscriptions[@]} == 0)); then
+    local current
+    current="$(az account show --query id -o tsv 2>/dev/null)" ||
+      die "no active Azure account (run 'az login')" "$EX_UNAVAILABLE"
+    subscriptions=("$current")
+  fi
+  ((${#subscriptions[@]} > 0)) || die "no subscriptions to export" "$EX_UNKNOWN"
+
+  local tag_keys header=(subscription_id resource_group name type location) t sub
+  tag_keys="$(tags_json)"
+  for t in "${tags[@]}"; do header+=("tag_${t}"); done
+  header+=(tags)
+
+  open_output "$output"
+  csv_row "${header[@]}"
+  for sub in "${subscriptions[@]}"; do
+    export_subscription "$sub" "$tag_keys"
+  done
+  [[ "$output" == "-" ]] || log_info "inventory written to ${output}"
+}
+
+main "$@"

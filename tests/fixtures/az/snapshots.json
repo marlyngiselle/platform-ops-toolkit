@@ -1,0 +1,6 @@
+[
+  {"id": "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/rg-lab/providers/Microsoft.Compute/snapshots/snap-2026-03",
+   "name": "snap-2026-03", "resourceGroup": "rg-lab", "location": "westeurope", "diskSizeGb": 128, "timeCreated": "2026-03-01T00:00:00+00:00"},
+  {"id": "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/rg-lab/providers/Microsoft.Compute/snapshots/snap-recent",
+   "name": "snap-recent", "resourceGroup": "rg-lab", "location": "westeurope", "diskSizeGb": 128, "timeCreated": "2026-12-20T00:00:00+00:00"}
+]

@@ -1,0 +1,214 @@
+#!/usr/bin/env bash
+#
+# az-orphans - find Azure resources that cost money but serve nothing:
+# unattached managed disks, unassociated public IPs, detached NICs and old
+# snapshots. Report-only by default; optional, confirmed cleanup.
+
+set -euo pipefail
+
+_self_dir() {
+  local src="${BASH_SOURCE[0]}" dir
+  while [[ -L "$src" ]]; do
+    dir="$(cd -P "$(dirname "$src")" && pwd)"
+    src="$(readlink "$src")"
+    [[ "$src" == /* ]] || src="${dir}/${src}"
+  done
+  cd -P "$(dirname "$src")" && pwd
+}
+# shellcheck source=../lib/common.sh
+source "$(_self_dir)/../lib/common.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: az-orphans [options]
+
+List orphaned resources in a subscription:
+  disk        managed disks in state Unattached
+  public-ip   public IPs not bound to an IP configuration or NAT gateway
+  nic         network interfaces with no VM and no private endpoint
+  snapshot    snapshots older than --snapshot-age days
+
+Options:
+  -s, --subscription ID|NAME   Subscription (default: current)
+  -g, --resource-group NAME    Limit to one resource group
+      --snapshot-age DAYS      Age threshold for snapshots (default: 90)
+      --keep-tag KEY=VALUE     Skip resources carrying this tag (default: keep=true)
+  -f, --format FORMAT          table | csv | json (default: table)
+      --fail-on-findings       Exit 1 when orphans are found (scheduled checks)
+
+Cleanup (disks, public IPs and NICs only; snapshots stay report-only):
+      --delete                 Delete the orphans found, after confirmation
+  -n, --dry-run                Print the delete commands only (implies --delete)
+  -y, --yes                    Skip the confirmation prompt
+  -v, --verbose | -q, --quiet | --no-color | --version | -h, --help
+
+Exit codes:
+  0 success   1 orphans found (with --fail-on-findings)   2 a deletion failed
+  64 usage error   69 missing dependency   77 confirmation declined
+
+Permissions: Reader to report. Cleanup needs delete rights on the resources,
+for example Contributor scoped to the resource group.
+
+Examples:
+  az-orphans -s sub-sandbox-01
+  az-orphans -g rg-lab-weu --delete --dry-run
+  az-orphans --format csv --snapshot-age 30 > orphans.csv
+EOF
+}
+
+subscription="" resource_group="" snapshot_age=90 keep_tag="keep=true"
+format=table fail_on_findings=0 delete=0
+
+azc() {
+  local scope=()
+  [[ -z "$subscription" ]] || scope+=(--subscription "$subscription")
+  [[ -z "$resource_group" ]] || scope+=(--resource-group "$resource_group")
+  az "$@" ${scope[@]+"${scope[@]}"} -o json
+}
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h | --help)
+        usage
+        exit 0
+        ;;
+      -s | --subscription)
+        require_arg "$@"
+        subscription="$2"
+        shift
+        ;;
+      -g | --resource-group)
+        require_arg "$@"
+        resource_group="$2"
+        shift
+        ;;
+      --snapshot-age)
+        require_arg "$@"
+        is_positive_int "$2" || usage_error "--snapshot-age must be a whole number of days"
+        snapshot_age="$2"
+        shift
+        ;;
+      --keep-tag)
+        require_arg "$@"
+        [[ "$2" == ?*=* ]] || usage_error "--keep-tag expects KEY=VALUE"
+        keep_tag="$2"
+        shift
+        ;;
+      -f | --format)
+        require_arg "$@"
+        case "$2" in table | csv | json) format="$2" ;; *) usage_error "unknown format: $2" ;; esac
+        shift
+        ;;
+      --fail-on-findings) fail_on_findings=1 ;;
+      --delete) delete=1 ;;
+      -n | --dry-run) DRY_RUN=1 delete=1 ;;
+      -y | --yes) ASSUME_YES=1 ;;
+      *)
+        handle_common_flag "$1" || usage_error "unknown option: $1"
+        ;;
+    esac
+    shift
+  done
+}
+
+# collect - print all findings as one JSON array of normalised records.
+collect() {
+  local now disks pips nics snaps
+  now="$(now_epoch)"
+  log_info "scanning disks, public IPs, NICs and snapshots"
+  disks="$(azc disk list)"
+  pips="$(azc network public-ip list)"
+  nics="$(azc network nic list)"
+  snaps="$(azc snapshot list)"
+
+  jq -n \
+    --argjson disks "$disks" --argjson pips "$pips" --argjson nics "$nics" --argjson snaps "$snaps" \
+    --argjson now "$now" --argjson maxage "$snapshot_age" \
+    --arg kkey "${keep_tag%%=*}" --arg kval "${keep_tag#*=}" '
+    def epoch: sub("\\.[0-9]+"; "") | sub("(\\+00:00|Z)?$"; "Z") | fromdateiso8601;
+    def age: if .timeCreated then (($now - (.timeCreated | epoch)) / 86400 | floor) else null end;
+    def kept: (.tags // {})[$kkey] == $kval;
+    def rec($kind; $detail): {kind: $kind, name, resourceGroup, location, detail: $detail, ageDays: age, id};
+    [ ($disks[] | select(.diskState == "Unattached" and (kept | not))
+        | rec("disk"; "\(.diskSizeGb)GB \(.sku.name // "")")),
+      ($pips[] | select(.ipConfiguration == null and .natGateway == null and (kept | not))
+        | rec("public-ip"; "\(.sku.name // "") \(.ipAddress // "unallocated")")),
+      ($nics[] | select(.virtualMachine == null and .privateEndpoint == null and (kept | not))
+        | rec("nic"; (.ipConfigurations[0].privateIPAddress // "-"))),
+      ($snaps[] | select((kept | not)) | select((age // 0) >= $maxage)
+        | rec("snapshot"; "\(.diskSizeGb)GB"))
+    ]'
+}
+
+render() {
+  local findings="$1"
+  case "$format" in
+    json) jq . <<<"$findings" ;;
+    csv)
+      csv_row kind name resource_group location detail age_days id
+      jq -r '.[] | [.kind, .name, .resourceGroup, .location, .detail, (.ageDays // ""), .id] | @csv' <<<"$findings"
+      ;;
+    table)
+      if [[ "$(jq length <<<"$findings")" == 0 ]]; then
+        echo "No orphaned resources found."
+        return 0
+      fi
+      printf '%-10s %-32s %-20s %-14s %-24s %s\n' KIND NAME RESOURCE_GROUP LOCATION DETAIL AGE_DAYS
+      jq -r '.[] | [.kind, .name, .resourceGroup, .location, .detail, (.ageDays // "-" | tostring)] | @tsv' <<<"$findings" |
+        while IFS=$'\t' read -r kind name rg loc detail age; do
+          printf '%-10s %-32s %-20s %-14s %-24s %s\n' "$kind" "$name" "$rg" "$loc" "$detail" "$age"
+        done
+      ;;
+  esac
+}
+
+cleanup() {
+  local findings="$1" ids count failed=0 kind id
+  ids="$(jq -r '.[] | select(.kind != "snapshot") | "\(.kind)\t\(.id)"' <<<"$findings")"
+  count="$(grep -c . <<<"$ids" || true)"
+  if ((count == 0)); then
+    log_info "nothing to delete"
+    return 0
+  fi
+
+  local sub_label
+  sub_label="$(az account show ${subscription:+--subscription "$subscription"} --query '[name, id]' -o tsv 2>/dev/null | tr '\t\n' '  ' | sed 's/ *$//')"
+  log_warn "cleanup target: subscription ${sub_label:-unknown}, ${count} resource(s); snapshots are never deleted"
+  if [[ "$DRY_RUN" != 1 ]]; then
+    confirm "Delete ${count} orphaned resource(s)?" || die "confirmation declined" "$EX_REFUSED"
+  fi
+
+  while IFS=$'\t' read -r kind id; do
+    case "$kind" in
+      disk) run_cmd az disk delete --ids "$id" --yes || failed=$((failed + 1)) ;;
+      public-ip) run_cmd az network public-ip delete --ids "$id" || failed=$((failed + 1)) ;;
+      nic) run_cmd az network nic delete --ids "$id" || failed=$((failed + 1)) ;;
+    esac
+  done <<<"$ids"
+
+  if ((failed > 0)); then
+    log_error "${failed} deletion(s) failed"
+    return "$EX_CRIT"
+  fi
+  return 0
+}
+
+main() {
+  parse_args "$@"
+  require_cmd az jq
+
+  local findings total
+  findings="$(collect)"
+  total="$(jq length <<<"$findings")"
+  render "$findings"
+  log_info "${total} orphaned resource(s) found (keep tag: ${keep_tag})"
+
+  if ((delete)); then
+    cleanup "$findings"
+  elif ((fail_on_findings && total > 0)); then
+    return "$EX_WARN"
+  fi
+}
+
+main "$@"

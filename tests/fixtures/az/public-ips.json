@@ -1,0 +1,8 @@
+[
+  {"id": "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/rg-lab/providers/Microsoft.Network/publicIPAddresses/pip-old-lb",
+   "name": "pip-old-lb", "resourceGroup": "rg-lab", "location": "westeurope", "ipAddress": "203.0.113.10",
+   "sku": {"name": "Standard"}, "ipConfiguration": null, "natGateway": null},
+  {"id": "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/rg-lab/providers/Microsoft.Network/publicIPAddresses/pip-in-use",
+   "name": "pip-in-use", "resourceGroup": "rg-lab", "location": "westeurope", "ipAddress": "203.0.113.11",
+   "sku": {"name": "Standard"}, "ipConfiguration": {"id": "/subscriptions/00000000-0000-0000-0000-000000000001/x"}}
+]

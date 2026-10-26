@@ -1,0 +1,8 @@
+[
+  {"id": "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/rg-lab/providers/Microsoft.Network/networkInterfaces/nic-old-vm",
+   "name": "nic-old-vm", "resourceGroup": "rg-lab", "location": "westeurope",
+   "ipConfigurations": [{"privateIPAddress": "10.10.1.4"}], "virtualMachine": null, "privateEndpoint": null},
+  {"id": "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/rg-lab/providers/Microsoft.Network/networkInterfaces/nic-pe",
+   "name": "nic-pe", "resourceGroup": "rg-lab", "location": "westeurope",
+   "ipConfigurations": [{"privateIPAddress": "10.10.2.4"}], "virtualMachine": null, "privateEndpoint": {"id": "pe"}}
+]

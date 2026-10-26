@@ -1,0 +1,234 @@
+#!/usr/bin/env bash
+#
+# aws-orphans - find AWS resources that cost money but serve nothing:
+# available EBS volumes, unassociated Elastic IPs, detached ENIs and old
+# snapshots. Report-only by default; optional, confirmed cleanup.
+
+set -euo pipefail
+
+_self_dir() {
+  local src="${BASH_SOURCE[0]}" dir
+  while [[ -L "$src" ]]; do
+    dir="$(cd -P "$(dirname "$src")" && pwd)"
+    src="$(readlink "$src")"
+    [[ "$src" == /* ]] || src="${dir}/${src}"
+  done
+  cd -P "$(dirname "$src")" && pwd
+}
+# shellcheck source=../lib/common.sh
+source "$(_self_dir)/../lib/common.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: aws-orphans [options]
+
+List orphaned resources per region:
+  volume     EBS volumes in state "available" (attached to nothing)
+  eip        Elastic IPs with no association
+  eni        network interfaces in state "available"
+  snapshot   snapshots owned by the account older than --snapshot-age days
+
+Options:
+  -r, --region NAME        Region to scan (repeatable; default: configured region)
+      --all-regions        Every region enabled for the account
+  -p, --profile NAME       AWS CLI profile
+      --snapshot-age DAYS  Age threshold for snapshots (default: 90)
+      --keep-tag KEY=VALUE Skip resources carrying this tag (default: keep=true)
+  -f, --format FORMAT      table | csv | json (default: table)
+      --fail-on-findings   Exit 1 when orphans are found (scheduled checks)
+
+Cleanup (volumes, EIPs and ENIs only; snapshots stay report-only):
+      --delete             Delete or release the orphans found, after confirmation
+  -n, --dry-run            Print the commands only (implies --delete)
+  -y, --yes                Skip the confirmation prompt
+  -v, --verbose | -q, --quiet | --no-color | --version | -h, --help
+
+Exit codes:
+  0 success   1 orphans found (with --fail-on-findings)   2 a deletion failed
+  64 usage error   69 missing dependency   77 confirmation declined
+
+Permissions: ec2:Describe* to report. Cleanup adds ec2:DeleteVolume,
+ec2:ReleaseAddress and ec2:DeleteNetworkInterface.
+
+Examples:
+  aws-orphans -r eu-west-1
+  aws-orphans --all-regions --format csv > orphans.csv
+  aws-orphans -r eu-west-1 --delete --dry-run
+EOF
+}
+
+regions=() all_regions=0 aws_args=() snapshot_age=90 keep_tag="keep=true"
+format=table fail_on_findings=0 delete=0
+
+awsc() {
+  aws ${aws_args[@]+"${aws_args[@]}"} "$@"
+}
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h | --help)
+        usage
+        exit 0
+        ;;
+      -r | --region)
+        require_arg "$@"
+        regions+=("$2")
+        shift
+        ;;
+      --all-regions) all_regions=1 ;;
+      -p | --profile)
+        require_arg "$@"
+        aws_args=(--profile "$2")
+        shift
+        ;;
+      --snapshot-age)
+        require_arg "$@"
+        is_positive_int "$2" || usage_error "--snapshot-age must be a whole number of days"
+        snapshot_age="$2"
+        shift
+        ;;
+      --keep-tag)
+        require_arg "$@"
+        [[ "$2" == ?*=* ]] || usage_error "--keep-tag expects KEY=VALUE"
+        keep_tag="$2"
+        shift
+        ;;
+      -f | --format)
+        require_arg "$@"
+        case "$2" in table | csv | json) format="$2" ;; *) usage_error "unknown format: $2" ;; esac
+        shift
+        ;;
+      --fail-on-findings) fail_on_findings=1 ;;
+      --delete) delete=1 ;;
+      -n | --dry-run) DRY_RUN=1 delete=1 ;;
+      -y | --yes) ASSUME_YES=1 ;;
+      *)
+        handle_common_flag "$1" || usage_error "unknown option: $1"
+        ;;
+    esac
+    shift
+  done
+  if ((all_regions)) && ((${#regions[@]} > 0)); then
+    usage_error "--all-regions and --region are mutually exclusive"
+  fi
+}
+
+# collect_region REGION - print the findings of one region as a JSON array.
+collect_region() {
+  local region="$1" now volumes addresses enis snaps
+  now="$(now_epoch)"
+  log_info "scanning ${region}"
+  volumes="$(awsc ec2 describe-volumes --region "$region" --filters Name=status,Values=available --output json)"
+  addresses="$(awsc ec2 describe-addresses --region "$region" --output json)"
+  enis="$(awsc ec2 describe-network-interfaces --region "$region" --filters Name=status,Values=available --output json)"
+  snaps="$(awsc ec2 describe-snapshots --region "$region" --owner-ids self --output json)"
+
+  jq -n \
+    --argjson v "$volumes" --argjson a "$addresses" --argjson e "$enis" --argjson s "$snaps" \
+    --arg region "$region" --argjson now "$now" --argjson maxage "$snapshot_age" \
+    --arg kkey "${keep_tag%%=*}" --arg kval "${keep_tag#*=}" '
+    def epoch: sub("\\.[0-9]+"; "") | sub("(\\+00:00|Z)?$"; "Z") | fromdateiso8601;
+    def age($t): if $t then (($now - ($t | epoch)) / 86400 | floor) else null end;
+    def kept: any((.Tags // .TagSet // [])[]; .Key == $kkey and .Value == $kval);
+    def name: ((.Tags // .TagSet // []) | map(select(.Key == "Name")) | first | .Value) // "-";
+    [ ($v.Volumes[] | select(kept | not)
+        | {kind: "volume", id: .VolumeId, name: name, region: $region,
+           detail: "\(.Size)GiB \(.VolumeType)", ageDays: age(.CreateTime)}),
+      ($a.Addresses[] | select(.AssociationId == null and (kept | not))
+        | {kind: "eip", id: .AllocationId, name: name, region: $region,
+           detail: .PublicIp, ageDays: null}),
+      ($e.NetworkInterfaces[] | select(kept | not)
+        | {kind: "eni", id: .NetworkInterfaceId, name: name, region: $region,
+           detail: (.PrivateIpAddress // "-"), ageDays: null}),
+      ($s.Snapshots[] | select(kept | not) | select((age(.StartTime) // 0) >= $maxage)
+        | {kind: "snapshot", id: .SnapshotId, name: name, region: $region,
+           detail: "\(.VolumeSize)GiB", ageDays: age(.StartTime)})
+    ]'
+}
+
+render() {
+  local findings="$1"
+  case "$format" in
+    json) jq . <<<"$findings" ;;
+    csv)
+      csv_row kind id name region detail age_days
+      jq -r '.[] | [.kind, .id, .name, .region, .detail, (.ageDays // "")] | @csv' <<<"$findings"
+      ;;
+    table)
+      if [[ "$(jq length <<<"$findings")" == 0 ]]; then
+        echo "No orphaned resources found."
+        return 0
+      fi
+      printf '%-9s %-26s %-24s %-14s %-18s %s\n' KIND ID NAME REGION DETAIL AGE_DAYS
+      jq -r '.[] | [.kind, .id, .name, .region, .detail, (.ageDays // "-" | tostring)] | @tsv' <<<"$findings" |
+        while IFS=$'\t' read -r kind id name region detail age; do
+          printf '%-9s %-26s %-24s %-14s %-18s %s\n' "$kind" "$id" "$name" "$region" "$detail" "$age"
+        done
+      ;;
+  esac
+}
+
+cleanup() {
+  local findings="$1" account items count failed=0 kind id region
+  items="$(jq -r '.[] | select(.kind != "snapshot") | "\(.kind)\t\(.id)\t\(.region)"' <<<"$findings")"
+  count="$(grep -c . <<<"$items" || true)"
+  if ((count == 0)); then
+    log_info "nothing to delete"
+    return 0
+  fi
+
+  account="$(awsc sts get-caller-identity --query Account --output text 2>/dev/null || echo unknown)"
+  log_warn "cleanup target: account ${account}, ${count} resource(s); snapshots are never deleted"
+  if [[ "$DRY_RUN" != 1 ]]; then
+    confirm "Delete or release ${count} orphaned resource(s) in account ${account}?" ||
+      die "confirmation declined" "$EX_REFUSED"
+  fi
+
+  while IFS=$'\t' read -r kind id region; do
+    case "$kind" in
+      volume) run_cmd aws ${aws_args[@]+"${aws_args[@]}"} ec2 delete-volume --region "$region" --volume-id "$id" || failed=$((failed + 1)) ;;
+      eip) run_cmd aws ${aws_args[@]+"${aws_args[@]}"} ec2 release-address --region "$region" --allocation-id "$id" || failed=$((failed + 1)) ;;
+      eni) run_cmd aws ${aws_args[@]+"${aws_args[@]}"} ec2 delete-network-interface --region "$region" --network-interface-id "$id" || failed=$((failed + 1)) ;;
+    esac
+  done <<<"$items"
+
+  if ((failed > 0)); then
+    log_error "${failed} deletion(s) failed"
+    return "$EX_CRIT"
+  fi
+  return 0
+}
+
+main() {
+  parse_args "$@"
+  require_cmd aws jq
+
+  if ((all_regions)); then
+    local r
+    for r in $(awsc ec2 describe-regions --query 'Regions[].RegionName' --output text); do
+      regions+=("$r")
+    done
+  elif ((${#regions[@]} == 0)); then
+    local configured
+    configured="$(awsc configure get region 2>/dev/null || true)"
+    regions=("${AWS_REGION:-${AWS_DEFAULT_REGION:-${configured:-us-east-1}}}")
+  fi
+
+  local findings="[]" region part total
+  for region in "${regions[@]}"; do
+    part="$(collect_region "$region")"
+    findings="$(jq -c --argjson p "$part" '. + $p' <<<"$findings")"
+  done
+  total="$(jq length <<<"$findings")"
+  render "$findings"
+  log_info "${total} orphaned resource(s) found across ${#regions[@]} region(s)"
+
+  if ((delete)); then
+    cleanup "$findings"
+  elif ((fail_on_findings && total > 0)); then
+    return "$EX_WARN"
+  fi
+}
+
+main "$@"

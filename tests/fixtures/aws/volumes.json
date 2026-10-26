@@ -1,0 +1,6 @@
+{"Volumes": [
+  {"VolumeId": "vol-0aaa1111bbbb2222c", "Size": 100, "VolumeType": "gp3", "CreateTime": "2026-05-01T09:00:00.000Z",
+   "Tags": [{"Key": "Name", "Value": "old-build-agent"}]},
+  {"VolumeId": "vol-0keep1111bbbb222d", "Size": 20, "VolumeType": "gp3", "CreateTime": "2026-05-01T09:00:00.000Z",
+   "Tags": [{"Key": "keep", "Value": "true"}]}
+]}

@@ -1,0 +1,4 @@
+{"Addresses": [
+  {"AllocationId": "eipalloc-0123456789abcdef0", "PublicIp": "198.51.100.20", "Domain": "vpc"},
+  {"AllocationId": "eipalloc-0fedcba9876543210", "PublicIp": "198.51.100.21", "Domain": "vpc", "AssociationId": "eipassoc-0a1b2c3d"}
+]}

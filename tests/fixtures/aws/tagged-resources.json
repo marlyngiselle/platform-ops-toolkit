@@ -1,0 +1,10 @@
+{
+  "ResourceTagMappingList": [
+    {"ResourceARN": "arn:aws:ec2:eu-west-1:111122223333:instance/i-0abc1234def567890",
+     "Tags": [{"Key": "Owner", "Value": "team-web"}, {"Key": "environment", "Value": "dev"}]},
+    {"ResourceARN": "arn:aws:s3:::example-artifacts-bucket",
+     "Tags": [{"Key": "owner", "Value": "team-platform"}]},
+    {"ResourceARN": "arn:aws:lambda:eu-west-1:111122223333:function:thumbnail-resizer",
+     "Tags": [{"Key": "cost-center", "Value": "cc-2002"}]}
+  ]
+}

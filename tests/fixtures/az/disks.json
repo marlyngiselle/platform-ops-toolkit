@@ -1,0 +1,11 @@
+[
+  {"id": "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/rg-lab/providers/Microsoft.Compute/disks/disk-old-vm-os",
+   "name": "disk-old-vm-os", "resourceGroup": "rg-lab", "location": "westeurope", "diskState": "Unattached",
+   "diskSizeGb": 128, "sku": {"name": "Premium_LRS"}, "timeCreated": "2026-06-01T10:00:00.1234567+00:00", "tags": {}},
+  {"id": "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/rg-lab/providers/Microsoft.Compute/disks/disk-golden-image",
+   "name": "disk-golden-image", "resourceGroup": "rg-lab", "location": "westeurope", "diskState": "Unattached",
+   "diskSizeGb": 64, "sku": {"name": "Standard_LRS"}, "timeCreated": "2026-01-01T10:00:00+00:00", "tags": {"keep": "true"}},
+  {"id": "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/rg-lab/providers/Microsoft.Compute/disks/disk-in-use",
+   "name": "disk-in-use", "resourceGroup": "rg-lab", "location": "westeurope", "diskState": "Attached",
+   "diskSizeGb": 32, "sku": {"name": "Premium_LRS"}, "timeCreated": "2026-01-01T10:00:00+00:00"}
+]
