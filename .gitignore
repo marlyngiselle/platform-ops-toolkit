@@ -1,0 +1,21 @@
+# Generated reports and exports
+k8s-triage-*.md
+*.csv
+!tests/fixtures/**/*.csv
+
+# Test output
+powershell/testResults.xml
+coverage.xml
+
+# Local environment and credentials (never commit)
+.env
+.env.*
+*.pem
+*.key
+*.pfx
+
+# Editors and OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
