@@ -1,0 +1,291 @@
+#!/usr/bin/env bash
+#
+# k8s-triage - one-shot, read-only troubleshooting report for a Kubernetes
+# namespace, written as Markdown so it can be pasted into a ticket.
+
+set -euo pipefail
+
+_self_dir() {
+  local src="${BASH_SOURCE[0]}" dir
+  while [[ -L "$src" ]]; do
+    dir="$(cd -P "$(dirname "$src")" && pwd)"
+    src="$(readlink "$src")"
+    [[ "$src" == /* ]] || src="${dir}/${src}"
+  done
+  cd -P "$(dirname "$src")" && pwd
+}
+# shellcheck source=../lib/common.sh
+source "$(_self_dir)/../lib/common.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: k8s-triage -n NAMESPACE [options]
+
+Collect the usual first-response checks for a namespace into one Markdown
+report: pods not ready, restarting containers, degraded deployments, pending
+PVCs, recent warning events and top resource consumers. Read-only.
+
+Options:
+  -n, --namespace NAME     Namespace to inspect (required)
+      --context NAME       kubectl context to use (default: current context)
+  -o, --output FILE        Report path, '-' for stdout
+                           (default: k8s-triage-<namespace>-<UTC timestamp>.md)
+  -r, --restart-threshold N
+                           Flag containers restarted at least N times (default: 3)
+  -e, --events N           Number of recent warning events to include (default: 20)
+      --fail-on-findings   Exit 1 when anything needs attention
+  -v, --verbose | -q, --quiet | --no-color | --version | -h, --help
+
+Exit codes:
+  0 report written   1 findings (with --fail-on-findings)
+  3 namespace or cluster unreachable   64 usage error   69 missing dependency
+
+Example:
+  k8s-triage -n payments --context aks-dev-weu -o /tmp/triage.md
+EOF
+}
+
+namespace="" context="" output="" restart_threshold=3 event_limit=20 fail_on_findings=0
+kube_args=()
+
+kc() {
+  kubectl ${kube_args[@]+"${kube_args[@]}"} "$@"
+}
+
+# Escape a value for a Markdown table cell.
+md_cell_filter='tostring | gsub("\\|"; "\\|") | gsub("[\\r\\n]+"; " ")'
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h | --help)
+        usage
+        exit 0
+        ;;
+      -n | --namespace)
+        require_arg "$@"
+        namespace="$2"
+        shift
+        ;;
+      --context)
+        require_arg "$@"
+        context="$2"
+        shift
+        ;;
+      -o | --output)
+        [[ $# -ge 2 && -n "$2" ]] || usage_error "option $1 requires a value"
+        output="$2"
+        shift
+        ;;
+      -r | --restart-threshold)
+        require_arg "$@"
+        is_positive_int "$2" || usage_error "--restart-threshold must be a whole number"
+        restart_threshold="$2"
+        shift
+        ;;
+      -e | --events)
+        require_arg "$@"
+        is_positive_int "$2" || usage_error "--events must be a whole number"
+        event_limit="$2"
+        shift
+        ;;
+      --fail-on-findings) fail_on_findings=1 ;;
+      *)
+        handle_common_flag "$1" || usage_error "unknown option: $1"
+        ;;
+    esac
+    shift
+  done
+  [[ -n "$namespace" ]] || usage_error "--namespace is required"
+}
+
+section_pods_not_ready() {
+  local pods_json="$1"
+  echo "## Pods not ready"
+  echo
+  jq -r --arg none "_None._" "
+    [.items[] | select(
+      .status.phase != \"Succeeded\" and
+      ([.status.conditions[]? | select(.type == \"Ready\" and .status == \"True\")] | length == 0)
+    )] as \$bad
+    | if (\$bad | length) == 0 then \$none else
+      \"| Pod | Phase | Reason | Ready | Node |\",
+      \"|---|---|---|---|---|\",
+      (\$bad[] | \"| \" + ([
+        .metadata.name,
+        (.status.phase // \"Unknown\"),
+        (([.status.containerStatuses[]? | .state.waiting.reason // .state.terminated.reason // empty] | first) // .status.reason // \"-\"),
+        \"\\([.status.containerStatuses[]? | select(.ready)] | length)/\\(.spec.containers | length)\",
+        (.spec.nodeName // \"unscheduled\")
+      ] | map(${md_cell_filter}) | join(\" | \")) + \" |\")
+    end" <<<"$pods_json"
+  echo
+}
+
+section_restarts() {
+  local pods_json="$1"
+  echo "## Containers restarted ${restart_threshold}+ times"
+  echo
+  jq -r --argjson min "$restart_threshold" --arg none "_None._" "
+    [.items[] | .metadata.name as \$pod | .status.containerStatuses[]?
+      | select(.restartCount >= \$min)
+      | {pod: \$pod, name, restartCount,
+         last: (.lastState.terminated.reason // \"-\"),
+         exit: (.lastState.terminated.exitCode // \"-\")}]
+    | sort_by(-.restartCount) as \$rows
+    | if (\$rows | length) == 0 then \$none else
+      \"| Pod | Container | Restarts | Last termination | Exit code |\",
+      \"|---|---|---|---|---|\",
+      (\$rows[] | \"| \" + ([.pod, .name, .restartCount, .last, .exit] | map(${md_cell_filter}) | join(\" | \")) + \" |\")
+    end" <<<"$pods_json"
+  echo
+}
+
+section_deployments() {
+  local deploy_json="$1"
+  echo "## Deployments with unavailable replicas"
+  echo
+  jq -r --arg none "_None._" "
+    [.items[] | select((.status.unavailableReplicas // 0) > 0 or
+                       (.status.availableReplicas // 0) < (.spec.replicas // 0))] as \$bad
+    | if (\$bad | length) == 0 then \$none else
+      \"| Deployment | Desired | Available | Updated |\",
+      \"|---|---|---|---|\",
+      (\$bad[] | \"| \" + ([.metadata.name, (.spec.replicas // 0),
+        (.status.availableReplicas // 0), (.status.updatedReplicas // 0)]
+        | map(${md_cell_filter}) | join(\" | \")) + \" |\")
+    end" <<<"$deploy_json"
+  echo
+}
+
+section_pvcs() {
+  local pvc_json="$1"
+  echo "## PersistentVolumeClaims not bound"
+  echo
+  jq -r --arg none "_None._" "
+    [.items[] | select(.status.phase != \"Bound\")] as \$bad
+    | if (\$bad | length) == 0 then \$none else
+      \"| PVC | Phase | StorageClass | Requested |\",
+      \"|---|---|---|---|\",
+      (\$bad[] | \"| \" + ([.metadata.name, (.status.phase // \"Unknown\"),
+        (.spec.storageClassName // \"default\"), (.spec.resources.requests.storage // \"-\")]
+        | map(${md_cell_filter}) | join(\" | \")) + \" |\")
+    end" <<<"$pvc_json"
+  echo
+}
+
+section_events() {
+  local events_json="$1"
+  echo "## Recent warning events (last ${event_limit})"
+  echo
+  jq -r --argjson limit "$event_limit" --arg none "_None._" "
+    [.items[] | select(.type == \"Warning\")
+      | . + {ts: (.lastTimestamp // .eventTime // .metadata.creationTimestamp // \"\")}]
+    | sort_by(.ts) | .[-\$limit:] | reverse as \$rows
+    | if (\$rows | length) == 0 then \$none else
+      \"| Last seen | Object | Reason | Count | Message |\",
+      \"|---|---|---|---|---|\",
+      (\$rows[] | \"| \" + ([.ts, \"\\(.involvedObject.kind)/\\(.involvedObject.name)\",
+        .reason, (.count // 1), ((.message // \"\") | .[0:160])]
+        | map(${md_cell_filter}) | join(\" | \")) + \" |\")
+    end" <<<"$events_json"
+  echo
+}
+
+section_top() {
+  echo "## Top pods by memory"
+  echo
+  local top
+  if top="$(kc top pod -n "$namespace" --no-headers 2>/dev/null)" && [[ -n "$top" ]]; then
+    echo "| Pod | CPU | Memory |"
+    echo "|---|---|---|"
+    # kubectl top prints e.g. "api-7d9c 12m 180Mi"; sort by memory value.
+    awk '{ m = $3; v = m + 0
+           if (m ~ /Ki$/) v *= 1024; else if (m ~ /Mi$/) v *= 1048576; else if (m ~ /Gi$/) v *= 1073741824
+           print v, $0 }' <<<"$top" | sort -k1,1nr | head -n 10 |
+      awk '{ printf "| %s | %s | %s |\n", $2, $3, $4 }'
+  else
+    echo "_Metrics API not available (is metrics-server installed?)._"
+  fi
+  echo
+}
+
+main() {
+  parse_args "$@"
+  require_cmd kubectl jq
+  if [[ -n "$context" ]]; then
+    kube_args=(--context "$context")
+  fi
+
+  if ! kc get namespace "$namespace" -o name >/dev/null 2>&1; then
+    die "namespace '${namespace}' not found or cluster unreachable" "$EX_UNKNOWN"
+  fi
+
+  local active_ctx ts pods deploys pvcs events
+  active_ctx="${context:-$(kc config current-context 2>/dev/null || echo unknown)}"
+  ts="$(date -u +%Y%m%dT%H%M%SZ)"
+  [[ -n "$output" ]] || output="k8s-triage-${namespace}-${ts}.md"
+
+  log_info "collecting from context '${active_ctx}', namespace '${namespace}'"
+  pods="$(kc get pods -n "$namespace" -o json)"
+  deploys="$(kc get deployments -n "$namespace" -o json)"
+  pvcs="$(kc get pvc -n "$namespace" -o json)"
+  events="$(kc get events -n "$namespace" -o json)"
+
+  local n_pods n_not_ready n_restarts n_deploys n_pvcs n_events findings
+  n_pods="$(jq '.items | length' <<<"$pods")"
+  n_not_ready="$(jq '[.items[] | select(.status.phase != "Succeeded" and
+    ([.status.conditions[]? | select(.type == "Ready" and .status == "True")] | length == 0))] | length' <<<"$pods")"
+  n_restarts="$(jq --argjson min "$restart_threshold" \
+    '[.items[].status.containerStatuses[]? | select(.restartCount >= $min)] | length' <<<"$pods")"
+  n_deploys="$(jq '[.items[] | select((.status.unavailableReplicas // 0) > 0 or
+    (.status.availableReplicas // 0) < (.spec.replicas // 0))] | length' <<<"$deploys")"
+  n_pvcs="$(jq '[.items[] | select(.status.phase != "Bound")] | length' <<<"$pvcs")"
+  n_events="$(jq '[.items[] | select(.type == "Warning")] | length' <<<"$events")"
+  findings=$((n_not_ready + n_restarts + n_deploys + n_pvcs))
+
+  (
+    open_output "$output"
+    echo "# Kubernetes triage: \`${namespace}\`"
+    echo
+    echo "- Context: \`${active_ctx}\`"
+    echo "- Generated: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "- Tool: k8s-triage ${TOOLKIT_VERSION} (read-only)"
+    echo
+    echo "## Summary"
+    echo
+    echo "| Check | Count |"
+    echo "|---|---|"
+    echo "| Pods | ${n_pods} |"
+    echo "| Pods not ready | ${n_not_ready} |"
+    echo "| Containers with ${restart_threshold}+ restarts | ${n_restarts} |"
+    echo "| Degraded deployments | ${n_deploys} |"
+    echo "| PVCs not bound | ${n_pvcs} |"
+    echo "| Warning events | ${n_events} |"
+    echo
+    section_pods_not_ready "$pods"
+    section_restarts "$pods"
+    section_deployments "$deploys"
+    section_pvcs "$pvcs"
+    section_events "$events"
+    section_top
+    echo "## Next commands"
+    echo
+    echo '```bash'
+    echo "kubectl -n ${namespace} describe pod <pod>"
+    echo "kubectl -n ${namespace} logs <pod> -c <container> --previous"
+    echo "kubectl -n ${namespace} get events --field-selector involvedObject.name=<pod>"
+    echo '```'
+  )
+
+  [[ "$output" == "-" ]] || log_info "report written to ${output}"
+  if ((findings > 0)); then
+    log_warn "${findings} finding(s) need attention"
+    if ((fail_on_findings)); then
+      return "$EX_WARN"
+    fi
+  fi
+  return 0
+}
+
+main "$@"

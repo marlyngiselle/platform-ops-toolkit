@@ -1,0 +1,6 @@
+{
+  "items": [
+    {"metadata": {"name": "data-api-0"}, "spec": {"storageClassName": "managed-csi", "resources": {"requests": {"storage": "10Gi"}}}, "status": {"phase": "Bound"}},
+    {"metadata": {"name": "reports-cache"}, "spec": {"storageClassName": "premium-zrs", "resources": {"requests": {"storage": "50Gi"}}}, "status": {"phase": "Pending"}}
+  ]
+}

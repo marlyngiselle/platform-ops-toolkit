@@ -1,0 +1,12 @@
+{
+  "items": [
+    {"type": "Normal", "reason": "Pulled", "lastTimestamp": "2026-12-31T23:50:00Z", "count": 1,
+     "involvedObject": {"kind": "Pod", "name": "api-7d9c6b5f4-x2k8p"}, "message": "Container image pulled"},
+    {"type": "Warning", "reason": "BackOff", "lastTimestamp": "2026-12-31T23:58:00Z", "count": 42,
+     "involvedObject": {"kind": "Pod", "name": "worker-5c8f7d9b8-q4m2z"}, "message": "Back-off restarting failed container worker"},
+    {"type": "Warning", "reason": "FailedScheduling", "lastTimestamp": "2026-12-31T23:55:00Z", "count": 7,
+     "involvedObject": {"kind": "Pod", "name": "report-job-28741-abcde"}, "message": "0/3 nodes are available: 3 Insufficient memory | preemption: 0/3 nodes"},
+    {"type": "Warning", "reason": "ProvisioningFailed", "lastTimestamp": "2026-12-31T23:40:00Z", "count": 3,
+     "involvedObject": {"kind": "PersistentVolumeClaim", "name": "reports-cache"}, "message": "storageclass \"premium-zrs\" not found"}
+  ]
+}

@@ -1,0 +1,6 @@
+{
+  "items": [
+    {"metadata": {"name": "api"}, "spec": {"replicas": 2}, "status": {"replicas": 2, "availableReplicas": 2, "updatedReplicas": 2}},
+    {"metadata": {"name": "worker"}, "spec": {"replicas": 3}, "status": {"replicas": 3, "availableReplicas": 1, "unavailableReplicas": 2, "updatedReplicas": 3}}
+  ]
+}
