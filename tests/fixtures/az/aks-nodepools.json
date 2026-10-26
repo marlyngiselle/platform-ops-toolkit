@@ -1,0 +1,6 @@
+[
+  {"name": "system", "mode": "System", "osType": "Linux", "currentOrchestratorVersion": "1.31.2",
+   "nodeImageVersion": "AKSUbuntu-2204gen2containerd-202610.01.0"},
+  {"name": "user", "mode": "User", "osType": "Linux", "currentOrchestratorVersion": "1.31.2",
+   "nodeImageVersion": "AKSUbuntu-2204gen2containerd-202609.15.0"}
+]

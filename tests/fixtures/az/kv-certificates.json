@@ -1,0 +1,4 @@
+[
+  {"id": "https://kv-app-dev.vault.azure.net/certificates/tls-web", "name": "tls-web",
+   "attributes": {"enabled": true, "expires": "2027-01-02T00:00:00+00:00"}}
+]

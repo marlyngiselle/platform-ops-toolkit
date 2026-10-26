@@ -1,0 +1,199 @@
+#!/usr/bin/env bash
+#
+# aks-node-image-check - compare the node image of every AKS node pool with
+# the latest image available for it, and optionally roll the image forward.
+
+set -euo pipefail
+
+_self_dir() {
+  local src="${BASH_SOURCE[0]}" dir
+  while [[ -L "$src" ]]; do
+    dir="$(cd -P "$(dirname "$src")" && pwd)"
+    src="$(readlink "$src")"
+    [[ "$src" == /* ]] || src="${dir}/${src}"
+  done
+  cd -P "$(dirname "$src")" && pwd
+}
+# shellcheck source=../lib/common.sh
+source "$(_self_dir)/../lib/common.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: aks-node-image-check [options]
+
+For each node pool, show the current node image, the latest image AKS offers
+for it and whether the pool is behind. Node image upgrades carry OS security
+patches without changing the Kubernetes version.
+
+Scope (default: every AKS cluster in the subscription):
+  -s, --subscription ID|NAME  Subscription (default: current)
+  -g, --resource-group NAME   Resource group of the cluster (with --cluster)
+  -c, --cluster NAME          A single cluster
+
+Output:
+  -f, --format FORMAT         table | json (default: table)
+
+Remediation (node image only, never the Kubernetes version):
+      --upgrade               Start a node image upgrade on outdated pools
+  -n, --dry-run               Print the upgrade commands only (implies --upgrade)
+  -y, --yes                   Skip the confirmation prompt
+  -v, --verbose | -q, --quiet | --no-color | --version | -h, --help
+
+Exit codes:
+  0 all pools current   1 at least one pool outdated   2 an upgrade failed to start
+  64 usage error   69 missing dependency   77 confirmation declined
+
+Permissions: Reader on the clusters to check. --upgrade needs
+Microsoft.ContainerService/managedClusters/agentPools/write, for example
+"Azure Kubernetes Service Contributor Role".
+
+Examples:
+  aks-node-image-check
+  aks-node-image-check -g rg-aks-dev -c aks-dev-weu --upgrade --dry-run
+EOF
+}
+
+subscription="" resource_group="" cluster="" format=table upgrade=0
+
+azc() {
+  az "$@" ${subscription:+--subscription "$subscription"} -o json
+}
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h | --help)
+        usage
+        exit 0
+        ;;
+      -s | --subscription)
+        require_arg "$@"
+        subscription="$2"
+        shift
+        ;;
+      -g | --resource-group)
+        require_arg "$@"
+        resource_group="$2"
+        shift
+        ;;
+      -c | --cluster)
+        require_arg "$@"
+        cluster="$2"
+        shift
+        ;;
+      -f | --format)
+        require_arg "$@"
+        case "$2" in table | json) format="$2" ;; *) usage_error "unknown format: $2" ;; esac
+        shift
+        ;;
+      --upgrade) upgrade=1 ;;
+      -n | --dry-run) DRY_RUN=1 upgrade=1 ;;
+      -y | --yes) ASSUME_YES=1 ;;
+      *)
+        handle_common_flag "$1" || usage_error "unknown option: $1"
+        ;;
+    esac
+    shift
+  done
+  if [[ -n "$cluster" && -z "$resource_group" ]] || [[ -z "$cluster" && -n "$resource_group" ]]; then
+    usage_error "--cluster and --resource-group must be given together"
+  fi
+}
+
+# list_clusters - print "resourceGroup<TAB>name" per cluster in scope.
+list_clusters() {
+  if [[ -n "$cluster" ]]; then
+    printf '%s\t%s\n' "$resource_group" "$cluster"
+  else
+    azc aks list | jq -r '.[] | [.resourceGroup, .name] | @tsv'
+  fi
+}
+
+# check_cluster RG NAME - print one JSON record per node pool.
+check_cluster() {
+  local rg="$1" name="$2" pools pool latest
+  pools="$(azc aks nodepool list --cluster-name "$name" --resource-group "$rg")"
+  while IFS= read -r pool; do
+    [[ -n "$pool" ]] || continue
+    latest="$(azc aks nodepool get-upgrades --cluster-name "$name" --resource-group "$rg" \
+      --nodepool-name "$pool" | jq -r '.latestNodeImageVersion // empty')" || latest=""
+    jq -c --arg rg "$rg" --arg cluster "$name" --arg pool "$pool" --arg latest "$latest" '
+      .[] | select(.name == $pool)
+      | {resourceGroup: $rg, cluster: $cluster, pool: .name, mode: .mode, os: .osType,
+         kubernetesVersion: (.currentOrchestratorVersion // .orchestratorVersion),
+         currentImage: .nodeImageVersion,
+         latestImage: (if $latest == "" then null else $latest end),
+         status: (if $latest == "" then "UNKNOWN"
+                  elif .nodeImageVersion == $latest then "CURRENT"
+                  else "OUTDATED" end)}' <<<"$pools"
+  done < <(jq -r '.[].name' <<<"$pools")
+}
+
+render() {
+  local results="$1"
+  if [[ "$format" == json ]]; then
+    jq . <<<"$results"
+    return 0
+  fi
+  printf '%-20s %-10s %-7s %-8s %-42s %-42s %s\n' CLUSTER POOL MODE K8S CURRENT_IMAGE LATEST_IMAGE STATUS
+  jq -r '.[] | [.cluster, .pool, .mode, .kubernetesVersion, .currentImage, (.latestImage // "-"), .status] | @tsv' <<<"$results" |
+    while IFS=$'\t' read -r c p m k cur lat st; do
+      printf '%-20s %-10s %-7s %-8s %-42s %-42s %s\n' "$c" "$p" "$m" "$k" "$cur" "$lat" "$st"
+    done
+}
+
+upgrade_pools() {
+  local results="$1" outdated count failed=0 rg c p
+  outdated="$(jq -r '.[] | select(.status == "OUTDATED") | [.resourceGroup, .cluster, .pool] | @tsv' <<<"$results")"
+  count="$(grep -c . <<<"$outdated" || true)"
+  if ((count == 0)); then
+    log_info "no outdated node pools, nothing to upgrade"
+    return 0
+  fi
+  if [[ "$DRY_RUN" != 1 ]]; then
+    confirm "Start a node image upgrade on ${count} node pool(s)? Nodes are cordoned, drained and reimaged." ||
+      die "confirmation declined" "$EX_REFUSED"
+  fi
+  while IFS=$'\t' read -r rg c p; do
+    run_cmd az aks nodepool upgrade --resource-group "$rg" --cluster-name "$c" --name "$p" \
+      --node-image-only --no-wait ${subscription:+--subscription "$subscription"} ||
+      failed=$((failed + 1))
+  done <<<"$outdated"
+  if ((failed > 0)); then
+    log_error "${failed} upgrade(s) failed to start"
+    return "$EX_CRIT"
+  fi
+  [[ "$DRY_RUN" == 1 ]] && return 0
+  log_info "upgrade requested; follow with: az aks nodepool show -g <rg> --cluster-name <cluster> -n <pool> --query provisioningState"
+  return 0
+}
+
+main() {
+  parse_args "$@"
+  require_cmd az jq
+
+  local records="" rg name
+  while IFS=$'\t' read -r rg name; do
+    [[ -n "$name" ]] || continue
+    log_info "checking ${rg}/${name}"
+    records+="$(check_cluster "$rg" "$name")"$'\n'
+  done < <(list_clusters)
+
+  local results outdated
+  results="$(jq -s -c . <<<"$records")"
+  if [[ "$(jq length <<<"$results")" == 0 ]]; then
+    log_warn "no AKS node pools found in scope"
+    return 0
+  fi
+  render "$results"
+  outdated="$(jq '[.[] | select(.status == "OUTDATED")] | length' <<<"$results")"
+  log_info "${outdated} outdated node pool(s)"
+
+  if ((upgrade)); then
+    upgrade_pools "$results"
+  elif ((outdated > 0)); then
+    return "$EX_WARN"
+  fi
+}
+
+main "$@"
